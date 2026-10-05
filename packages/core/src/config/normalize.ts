@@ -421,6 +421,15 @@ function normalizeExperimental(
         )
         if (value !== undefined) result.portable_shell_scanner = value
       }
+      if (own(experimental, "shell_workspace_changes")) {
+        const value = decodeEncoded(
+          ConfigExperimental.Info.fields.shell_workspace_changes,
+          experimental.shell_workspace_changes,
+          ["experimental", "shell_workspace_changes"],
+          diagnostics,
+        )
+        if (value !== undefined) result.shell_workspace_changes = value
+      }
       if (own(experimental, "subagent_depth")) {
         const value = decodeEncoded(
           ConfigExperimental.Info.fields.subagent_depth,

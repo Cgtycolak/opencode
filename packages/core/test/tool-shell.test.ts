@@ -36,6 +36,8 @@ import { Shell } from "@opencode/core/shell"
 import { ShellSelect } from "@opencode/core/shell/select"
 import { ID } from "@opencode/schema/shell"
 import { ShellTool } from "@opencode/core/tool/plugin/shell"
+import { ShellWorkspaceChanges } from "@opencode/core/shell/workspace-changes"
+import { Snapshot } from "@opencode/core/snapshot"
 import { ToolOutput } from "@opencode/core/tool-output"
 import { Tool } from "@opencode/core/tool"
 import { tmpdir, tmpdirScoped } from "./fixture/tmpdir"
@@ -51,8 +53,10 @@ const sessionModel = Model.Ref.make({ id: Model.ID.make("test"), providerID: Pro
 const assertions: Permission.AssertInput[] = []
 let denyAction: string | undefined
 let afterPermission = (_input: Permission.AssertInput): Effect.Effect<void> => Effect.void
+let checkEffect = (_input: Permission.AssertInput): Permission.AskResult["effect"] => "allow"
 
 const permission = permissionLayer({
+  check: (input) => Effect.sync(() => checkEffect(input)),
   assert: (input) =>
     Effect.sync(() => assertions.push(input)).pipe(
       Effect.andThen(Effect.suspend(() => afterPermission(input))),
@@ -74,6 +78,7 @@ const reset = () => {
   assertions.length = 0
   denyAction = undefined
   afterPermission = () => Effect.void
+  checkEffect = () => "allow"
 }
 
 const executionNode = makeGlobalNode({
@@ -138,6 +143,8 @@ const shellPluginSupervisor = makeLocationNode({
     Job.node,
     Shell.node,
     ShellSelect.node,
+    Snapshot.node,
+    Location.node,
     Tool.node,
   ],
 })
@@ -1793,4 +1800,312 @@ describe("ShellTool", () => {
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]().then(() => undefined)),
     ),
   )
+})
+
+describe("ShellTool workspace change report", () => {
+  // POSIX-only commands; the report itself is platform-neutral.
+  const posix = isWindows ? it.live.skip : it.live
+
+  const runGit = (cwd: string, ...args: string[]) => {
+    const result = Bun.spawnSync(["git", ...args], {
+      cwd,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@t",
+      },
+    })
+    if (result.exitCode !== 0) throw new Error(result.stderr.toString())
+  }
+
+  const withRepo = <A, E, R>(
+    files: Record<string, string>,
+    body: (registry: Tool.Interface, directory: string) => Effect.Effect<A, E, R>,
+    options: { git?: boolean } = {},
+  ) =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          reset()
+          yield* Effect.promise(() =>
+            Promise.all(
+              Object.entries(files).map(async ([file, content]) => {
+                await fs.mkdir(path.dirname(path.join(tmp.path, file)), { recursive: true })
+                await Bun.write(path.join(tmp.path, file), content)
+              }),
+            ),
+          )
+          if (options.git !== false) {
+            runGit(tmp.path, "init", "-q")
+            runGit(tmp.path, "add", "-A")
+            runGit(tmp.path, "commit", "-qm", "init")
+          }
+          return yield* withSession(tmp.path, (registry) => body(registry, tmp.path))
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]().then(() => undefined)),
+    )
+
+  const report = (result: { content?: ReadonlyArray<Tool.Content> }) => {
+    const texts = (result.content ?? []).flatMap((part) => (part.type === "text" ? [part.text] : []))
+    return texts.find((text) => text.startsWith("<workspace_changes>"))
+  }
+
+  posix("reports a modified tracked file as the last content part", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(registry, call({ command: "printf 'two\\n' >> a.txt; printf done" }))
+        expect(result.status).toBe("completed")
+        expect(result.content?.[0]).toEqual({ type: "text", text: "done" })
+        expect(result.content?.at(-1)).toEqual({ type: "text", text: report(result)! })
+        expect(report(result)).toContain("M a.txt (+1 -0)")
+        expect(result.metadata?.workspaceChanges).toEqual({
+          files: [{ file: "a.txt", status: "modified", additions: 1, deletions: 0, binary: false }],
+          more: 0,
+        })
+      }),
+    ),
+  )
+
+  posix("reports a new untracked file", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(registry, call({ command: "printf 'x\\ny\\n' > new.txt" }))
+        expect(report(result)).toContain("A new.txt (+2 -0)")
+      }),
+    ),
+  )
+
+  posix("stays silent for a read-only command", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(registry, call({ command: "cat a.txt" }))
+        expect(result.content).toEqual([{ type: "text", text: "one\n" }])
+        expect(result.metadata?.workspaceChanges).toBeUndefined()
+      }),
+    ),
+  )
+
+  posix("stays silent for writes to gitignored paths", () =>
+    withRepo({ ".gitignore": "build/\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(registry, call({ command: "mkdir -p build && printf x > build/out.txt" }))
+        expect(report(result)).toBeUndefined()
+      }),
+    ),
+  )
+
+  posix("stays silent outside a git repository", () =>
+    withRepo(
+      { "a.txt": "one\n" },
+      (registry) =>
+        Effect.gen(function* () {
+          const result = yield* executeTool(registry, call({ command: "printf two >> a.txt" }))
+          expect(result.status).toBe("completed")
+          expect(report(result)).toBeUndefined()
+        }),
+      { git: false },
+    ),
+  )
+
+  posix("stays silent when disabled in config", () =>
+    withRepo(
+      { "a.txt": "one\n", "opencode.json": JSON.stringify({ experimental: { shell_workspace_changes: false } }) },
+      (registry) =>
+        Effect.gen(function* () {
+          const result = yield* executeTool(registry, call({ command: "printf two >> a.txt" }))
+          expect(result.status).toBe("completed")
+          expect(report(result)).toBeUndefined()
+        }),
+    ),
+  )
+
+  posix("reports partial writes from a failing command alongside the exit notice", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(registry, call({ command: "printf 'two\\n' >> a.txt; exit 3" }))
+        const texts = (result.content ?? []).flatMap((part) => (part.type === "text" ? [part.text] : []))
+        expect(texts).toContain("Exited with code 3")
+        expect(report(result)).toContain("M a.txt (+1 -0)")
+      }),
+    ),
+  )
+
+  posix("reports writes made before a timeout", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(
+          registry,
+          call({ command: "printf 'two\\n' >> a.txt; sleep 5", timeout: 500 }),
+        )
+        const texts = (result.content ?? []).flatMap((part) => (part.type === "text" ? [part.text] : []))
+        expect(texts).toContain("Timed out before completion")
+        expect(report(result)).toContain("M a.txt (+1 -0)")
+      }),
+    ),
+  )
+
+  posix("does not report for background commands", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(registry, call({ command: "printf two >> a.txt", background: true }))
+        expect(result.status).toBe("completed")
+        expect(report(result)).toBeUndefined()
+      }),
+    ),
+  )
+
+  posix("caps the listed files", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(
+          registry,
+          call({ command: "for i in $(seq -w 1 30); do printf x > file$i.txt; done" }),
+        )
+        const text = report(result)!
+        expect(text.split("\n").filter((line) => line.startsWith("A "))).toHaveLength(20)
+        expect(text).toContain("... and 10 more files")
+      }),
+    ),
+  )
+
+  posix("does not list untracked files above the snapshot size limit", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(registry, call({ command: "head -c 3000000 /dev/zero > big.bin" }))
+        expect(report(result)).toBeUndefined()
+      }),
+    ),
+  )
+
+  posix("handles concurrent shell calls without blocking", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const [first, second] = yield* Effect.all(
+          [
+            executeTool(registry, call({ command: "sleep 0.2; printf x > first.txt" }, "call-first")),
+            executeTool(registry, call({ command: "sleep 0.2; printf y > second.txt" }, "call-second")),
+          ],
+          { concurrency: "unbounded" },
+        ).pipe(Effect.timeout("10 seconds"))
+        // Overlapping windows may legitimately list each other's files; each must at least list its own.
+        expect(report(first)).toContain("A first.txt")
+        expect(report(second)).toContain("A second.txt")
+      }),
+    ),
+  )
+
+  const text = (result: { content?: ReadonlyArray<Tool.Content> }) =>
+    (result.content ?? []).flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
+
+  for (const effect of ["ask", "deny"] as const)
+    posix(`withholds diff content when reading the file is ${effect}`, () =>
+      withRepo({ "a.txt": "one\n" }, (registry) =>
+        Effect.gen(function* () {
+          const checks: Permission.AssertInput[] = []
+          checkEffect = (input) => {
+            checks.push(input)
+            return input.resources.includes("notes.txt") ? effect : "allow"
+          }
+          const result = yield* executeTool(
+            registry,
+            call({ command: "printf 'private-note\\n' > notes.txt; printf 'two\\n' >> a.txt" }),
+          )
+          const changes = report(result)!
+          expect(changes).toContain("A notes.txt (+1 -0)")
+          expect(changes).toContain(`notes.txt\n${ShellWorkspaceChanges.WITHHELD}`)
+          expect(changes).toContain("a.txt\n@@ -1,0 +2 @@ one\n+two")
+          expect(text(result)).not.toContain("private-note")
+          expect(checks.map((input) => [input.action, input.resources])).toEqual([
+            ["read", ["a.txt"]],
+            ["read", ["notes.txt"]],
+          ])
+          expect(checks[0]?.source).toEqual({ type: "tool", messageID: toolIdentity.messageID, id: "call-shell" })
+        }),
+      ),
+    )
+
+  const envTest = isWindows ? permissionIt.live.skip : permissionIt.live
+  envTest("withholds .env content under the default read rules without prompting", () =>
+    withRepo({ "a.txt": "one\n" }, (registry) =>
+      Effect.gen(function* () {
+        const agents = yield* Agent.Service
+        yield* agents.transform((editor) =>
+          editor.update(toolIdentity.agent, (agent) => {
+            agent.permissions = [
+              { action: "shell", resource: "*", effect: "allow" },
+              // Mirrors the default agent read rules (plugin/agent.ts), plus an explicit deny.
+              { action: "read", resource: "*", effect: "allow" },
+              { action: "read", resource: "*.env", effect: "ask" },
+              { action: "read", resource: "*.env.*", effect: "ask" },
+              { action: "read", resource: "*.env.example", effect: "allow" },
+              { action: "read", resource: "secret.txt", effect: "deny" },
+            ]
+          }),
+        )
+        const result = yield* executeTool(
+          registry,
+          call({
+            command: [
+              "printf 'API_KEY=s3cr3t-env\\n' > .env",
+              "printf 'TOKEN=s3cr3t-local\\n' > .env.local",
+              "printf 'API_KEY=placeholder\\n' > .env.example",
+              "printf 's3cr3t-file\\n' > secret.txt",
+              "printf 'two\\n' >> a.txt",
+            ].join("; "),
+          }),
+        )
+        const changes = report(result)!
+        for (const file of [".env", ".env.local", "secret.txt"]) {
+          expect(changes).toContain(`A ${file} (+1 -0)`)
+          expect(changes).toContain(`${file}\n${ShellWorkspaceChanges.WITHHELD}`)
+        }
+        expect(text(result)).not.toContain("s3cr3t")
+        expect(changes).toContain(".env.example\n@@ -0,0 +1 @@\n+API_KEY=placeholder")
+        expect(changes).toContain("+two")
+        const permission = yield* Permission.Service
+        expect(yield* permission.list()).toEqual([])
+      }),
+    ),
+  )
+
+  posix("shows which region an anchored shell edit replaced", () => {
+    const first = Array.from({ length: 30 }, (_, index) => `    echo first ${index}`)
+    const second = Array.from({ length: 20 }, (_, index) => `    echo second ${index}`)
+    const original = [
+      "import os",
+      "",
+      '_SOURCE_FIRST = """\\',
+      "    for item in $response; do",
+      ...first,
+      "    done",
+      '"""',
+      "",
+      '_SOURCE_SECOND = """\\',
+      "    for item in $response;",
+      ...second,
+      "    end;",
+      "complete --command %(prog)s",
+      '"""',
+      "",
+    ].join("\n")
+    // The anchor also matches the first template, so everything up to the second template's end marker is replaced.
+    const command =
+      `awk '!done && !skip && /for item in \\$response/ { skip = 1; print "    for item in $response;"; print "    end;" } ` +
+      `skip && /^complete --command/ { skip = 0; done = 1 } !skip' completion.py > completion.tmp && ` +
+      "mv completion.tmp completion.py"
+    return withRepo({ "completion.py": original }, (registry) =>
+      Effect.gen(function* () {
+        const result = yield* executeTool(registry, call({ command }))
+        expect(result.status).toBe("completed")
+        expect(report(result)).toContain("M completion.py (+0 -55)")
+        // The bounded diff shows that the removed region starts in the first template, not the second.
+        expect(report(result)).toContain('@@ -4,35 +3,0 @@ _SOURCE_FIRST = """\\')
+        expect(report(result)).toContain("-    for item in $response; do")
+        expect(report(result)).toContain("[diff truncated: 17 more lines]")
+      }),
+    )
+  })
 })

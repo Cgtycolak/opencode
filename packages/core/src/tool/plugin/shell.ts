@@ -6,9 +6,11 @@ import type { SessionHooks } from "@opencode/plugin/effect/session"
 import type { ShellCreateBefore } from "@opencode/plugin/effect/shell"
 import type { Tool } from "@opencode/schema/tool"
 import { Deferred, Effect, Schema, Scope } from "effect"
+import path from "path"
 import { Config } from "../../config.js"
 import { Environment } from "../../environment/index.js"
 import { Job } from "../../job.js"
+import { Location } from "../../location.js"
 import { FileAccess } from "../../file-access.js"
 import { Permission } from "../../permission.js"
 import { NonNegativeInt } from "../../schema.js"
@@ -18,6 +20,8 @@ import { Shell } from "../../shell.js"
 import { ShellParse } from "../../shell/parse.js"
 import { ShellSelect } from "../../shell/select.js"
 import { ShellResult } from "../../shell/result.js"
+import { ShellWorkspaceChanges } from "../../shell/workspace-changes.js"
+import { Snapshot } from "../../snapshot.js"
 
 export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
@@ -80,14 +84,17 @@ const resultMessages = (output: Output) => {
   return [...(output.output ? [output.output] : []), ...(notice ? [notice] : [])]
 }
 
-const toolResult = (output: Output) => {
+const toolResult = (output: Output, changes?: ShellWorkspaceChanges.Summary) => {
+  const report = changes ? ShellWorkspaceChanges.render(changes) : undefined
   return {
     output,
-    content: resultMessages(output).map((text) => ({ type: "text" as const, text })),
+    content: [...resultMessages(output), ...(report ? [report] : [])].map((text) => ({ type: "text" as const, text })),
     metadata: {
       status: output.status,
       ...ShellResult.metadata(output),
       ...(output.shellID !== undefined ? { shellID: output.shellID } : {}),
+      // Metadata keeps the file list only; the bounded diff is model-visible text.
+      ...(report && changes ? { workspaceChanges: { files: changes.files, more: changes.more } } : {}),
     },
   }
 }
@@ -112,6 +119,48 @@ export const Plugin = {
     const compatibleShell = shellSelect.resolve({ priority: "compat" })
     const permission = yield* Permission.Service
     const config = yield* Config.Service
+    const snapshots = yield* Snapshot.Service
+    const location = yield* Location.Service
+
+    // Compares the tree captured right before spawn with the tree right after the command settled. Snapshot
+    // failures only drop the report; they never fail the shell command itself.
+    const workspaceChanges = Effect.fn("ShellTool.workspaceChanges")(
+      function* (before: Snapshot.ID | undefined, context: Tool.Context) {
+        if (!before) return undefined
+        const after = yield* snapshots.capture()
+        if (!after || after === before) return undefined
+        const files = yield* snapshots.files({ from: before, to: after })
+        if (files.length === 0) return undefined
+        const shown = files.slice(0, ShellWorkspaceChanges.MAX_FILES)
+        const diffs = yield* snapshots.diff({ from: before, to: after, context: 0, paths: shown })
+        const withheld = yield* Effect.forEach(
+          diffs.filter((diff) => diff.patch !== ""),
+          (diff) => readAllowed(diff.file, context).pipe(Effect.map((allowed) => (allowed ? [] : [diff.file]))),
+        )
+        return ShellWorkspaceChanges.summarize(files, diffs, new Set(withheld.flat()))
+      },
+      Effect.catch((cause) =>
+        Effect.logWarning("failed to compute shell workspace changes", { cause }).pipe(Effect.as(undefined)),
+      ),
+    )
+
+    // Diff content is file content, so it is only shown when reading the file is explicitly allowed. Uses the same
+    // resource as the read tool and the effective (non-prompting) decision; any failure withholds the content.
+    const readAllowed = (file: string, context: Tool.Context) =>
+      access.resolve({ path: path.resolve(location.project.directory, file), kind: "file" }).pipe(
+        Effect.flatMap((target) =>
+          permission.check({
+            sessionID: context.sessionID,
+            agent: context.agent,
+            action: "read",
+            resources: [target.resource],
+            save: ["*"],
+            source: { type: "tool", messageID: context.messageID, id: context.id },
+          }),
+        ),
+        Effect.map((effect) => effect === "allow"),
+        Effect.catch(() => Effect.succeed(false)),
+      )
 
     const prepare = Effect.fn("ShellTool.prepare")(function* (invocation: ShellCreateBefore, context: Tool.Context) {
       const source = {
@@ -197,6 +246,11 @@ export const Plugin = {
             Effect.gen(function* () {
               const timeout = input.background === true ? (input.timeout ?? 0) : (input.timeout ?? DEFAULT_TIMEOUT_MS)
               let finalTimeout = timeout
+              // Background commands keep running while the agent works, so their changes cannot be attributed.
+              const reportChanges =
+                input.background !== true &&
+                Config.latest(yield* config.entries(), "experimental")?.shell_workspace_changes !== false
+              let before: Snapshot.ID | undefined
               const info = yield* shell.create(
                 {
                   command: input.command,
@@ -212,6 +266,8 @@ export const Plugin = {
                     invocation.env.AI_AGENT ||= "opencode"
                     invocation.env.OPENCODE_SESSION_ID = context.sessionID
                     finalTimeout = yield* prepare(invocation, context)
+                    // After approval and immediately before spawn, so permission waits stay outside the window.
+                    if (reportChanges) before = yield* snapshots.capture()
                   }),
               )
               yield* context.progress({ shellID: info.id })
@@ -251,7 +307,7 @@ export const Plugin = {
               if (input.background === true) {
                 yield* jobs.background(job.id)
                 yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
-                return backgroundResult(info.id, info.file)
+                return toolResult(backgroundResult(info.id, info.file))
               }
 
               const result = yield* jobs
@@ -260,15 +316,15 @@ export const Plugin = {
               if (result?.type === "backgrounded") {
                 yield* shell.timeout(info.id, 0)
                 yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
-                return backgroundResult(info.id, info.file)
+                return toolResult(backgroundResult(info.id, info.file))
               }
               if (result?.info.status === "error")
                 return yield* Effect.fail(new Error(result.info.error ?? "Command failed"))
               if (result?.info.status === "cancelled") return yield* Effect.fail(new Error("Command cancelled"))
 
-              return yield* Deferred.await(settled)
+              const output = yield* Deferred.await(settled)
+              return toolResult(output, yield* workspaceChanges(before, context))
             }).pipe(
-              Effect.map(toolResult),
               Effect.mapError(
                 (error) => new ToolFailure({ message: `Unable to execute command: ${input.command}`, error }),
               ),

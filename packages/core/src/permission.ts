@@ -104,6 +104,11 @@ export interface Interface {
   readonly close: Effect.Effect<void>
   readonly ask: (input: AssertInput) => Effect.Effect<AskResult, SessionErrors.NotFoundError>
   readonly assert: (input: AssertInput) => Effect.Effect<void, Error | SessionErrors.NotFoundError>
+  /**
+   * Resolve the effective decision that `ask`/`assert` would act on, including saved approvals and the
+   * `permission.evaluate` hook, without creating a request or prompting.
+   */
+  readonly check: (input: AssertInput) => Effect.Effect<Permission.Effect, SessionErrors.NotFoundError>
   readonly reply: (input: ReplyInput) => Effect.Effect<void, NotFoundError>
   readonly get: (id: ID) => Effect.Effect<Request | undefined>
   readonly forSession: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<Request>>
@@ -228,6 +233,11 @@ const layer = Layer.effect(
       return { id: value.id, effect: result.effect }
     })
 
+    const check = Effect.fn("Permission.check")(function* (input: AssertInput) {
+      if (closed) return "deny" as const
+      return (yield* evaluateInput(input)).effect
+    })
+
     const assert = Effect.fn("Permission.assert")((input: AssertInput) =>
       Effect.gen(function* () {
         if (closed) return yield* Effect.die(new DeclinedError())
@@ -336,7 +346,7 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.request).filter((request) => request.sessionID === sessionID)
     })
 
-    return Service.of({ ask, assert, reply, get, forSession, list, close })
+    return Service.of({ ask, assert, check, reply, get, forSession, list, close })
   }),
 )
 

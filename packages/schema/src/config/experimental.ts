@@ -8,6 +8,10 @@ export class Info extends Schema.Class<Info>("ConfigExperimental.Info")({
   portable_shell_scanner: Schema.Boolean.pipe(optional).annotate({
     description: "Enable the experimental portable shell permission scanner. Defaults to false.",
   }),
+  shell_workspace_changes: Schema.Boolean.pipe(optional).annotate({
+    description:
+      "Report workspace files changed while a foreground shell command runs, using snapshots. Defaults to true.",
+  }),
   subagent_depth: NonNegativeInt.pipe(optional).annotate({
     description: "Maximum subagent nesting depth. Defaults to 1.",
   }),

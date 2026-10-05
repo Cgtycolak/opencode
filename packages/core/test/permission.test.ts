@@ -9,6 +9,7 @@ import { Location } from "@opencode/core/location"
 import { Permission } from "@opencode/core/permission"
 import { PermissionTable } from "@opencode/core/permission/sql"
 import { PermissionSaved } from "@opencode/core/permission/saved"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
@@ -26,7 +27,15 @@ const current = Layer.succeed(
 )
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, PermissionSaved.node, Agent.node, Permission.node]),
+    LayerNode.group([
+      Database.node,
+      Bus.node,
+      SessionStore.node,
+      PermissionSaved.node,
+      Agent.node,
+      PluginHooks.node,
+      Permission.node,
+    ]),
     [Location.node.replace(current)],
   ),
 )
@@ -98,6 +107,51 @@ function waitForRequest(input: Partial<Permission.AssertInput> = {}) {
 }
 
 describe("Permission", () => {
+  it.effect("checks the effective decision without creating a request", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        { action: "read", resource: "*", effect: "allow" },
+        { action: "read", resource: "*.env", effect: "ask" },
+        { action: "read", resource: "*.env.*", effect: "ask" },
+        { action: "read", resource: "*.env.example", effect: "allow" },
+        { action: "read", resource: "secret.txt", effect: "deny" },
+      ])
+      const service = yield* Permission.Service
+      const check = (resource: string) => service.check(assertion({ resources: [resource] }))
+
+      expect(yield* check("src/index.ts")).toBe("allow")
+      expect(yield* check(".env")).toBe("ask")
+      expect(yield* check(".env.local")).toBe("ask")
+      expect(yield* check(".env.example")).toBe("allow")
+      expect(yield* check("secret.txt")).toBe("deny")
+      expect(yield* service.list()).toEqual([])
+      expect(yield* service.get(Permission.ID.create("per_test"))).toBeUndefined()
+    }),
+  )
+
+  it.effect("check includes the evaluate hook but keeps configured denies final", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        { action: "read", resource: "*", effect: "allow" },
+        { action: "read", resource: "secret.txt", effect: "deny" },
+      ])
+      const hooks = yield* PluginHooks.Service
+      const seen: string[] = []
+      yield* hooks.register("permission", "evaluate", (event) =>
+        Effect.sync(() => {
+          seen.push(...event.resources)
+          if (event.resources.includes("hooked.ts")) event.effect = "ask"
+        }),
+      )
+      const service = yield* Permission.Service
+
+      expect(yield* service.check(assertion({ resources: ["hooked.ts"] }))).toBe("ask")
+      expect(yield* service.check(assertion({ resources: ["secret.txt"] }))).toBe("deny")
+      expect(seen).toEqual(["hooked.ts"])
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
   it.effect("returns the evaluated effect and only queues prompts", () =>
     Effect.gen(function* () {
       yield* setup([{ action: "read", resource: "*", effect: "allow" }])
